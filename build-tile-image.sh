@@ -12,6 +12,7 @@ Options:
   --render-threads VALUE   Override RENDER_THREADS used by renderd
   --osm-cache VALUE        Override OSM2PGSQL_CACHE (in MiB)
   --osm-procs VALUE        Override OSM2PGSQL_NUM_PROCESSES
+  --render-progress VALUE  Report progress every N tiles (0 disables progress logs)
   --reset-database         Force database reset before import
   --no-reset-database      Skip resetting the database before import
   --image-tag TAG          Use a custom container image tag (default env IMAGE_TAG or maprender-renderrer:latest)
@@ -30,6 +31,7 @@ MAX_ZOOM_OVERRIDE=""
 RENDER_THREADS_OVERRIDE=""
 OSM_CACHE_OVERRIDE=""
 OSM_PROCS_OVERRIDE=""
+RENDER_PROGRESS_OVERRIDE=""
 RESET_DATABASE_OVERRIDE=""
 IMAGE_TAG_OVERRIDE=""
 SHM_SIZE_OVERRIDE=""
@@ -87,6 +89,16 @@ while [[ $# -gt 0 ]]; do
         exit 1
       fi
       OSM_PROCS_OVERRIDE=$2
+      shift 2
+      continue
+      ;;
+    --render-progress)
+      if [[ $# -lt 2 ]]; then
+        echo '--render-progress requires a value.' >&2
+        usage >&2
+        exit 1
+      fi
+      RENDER_PROGRESS_OVERRIDE=$2
       shift 2
       continue
       ;;
@@ -251,6 +263,9 @@ if [[ -n "${OSM_CACHE_OVERRIDE}" ]]; then
 fi
 if [[ -n "${OSM_PROCS_OVERRIDE}" ]]; then
   ENV_ARGS+=(-e OSM2PGSQL_NUM_PROCESSES="${OSM_PROCS_OVERRIDE}")
+fi
+if [[ -n "${RENDER_PROGRESS_OVERRIDE}" ]]; then
+  ENV_ARGS+=(-e RENDER_PROGRESS_INTERVAL="${RENDER_PROGRESS_OVERRIDE}")
 fi
 if [[ -n "${RESET_DATABASE_OVERRIDE}" ]]; then
   ENV_ARGS+=(-e RESET_DATABASE="${RESET_DATABASE_OVERRIDE}")

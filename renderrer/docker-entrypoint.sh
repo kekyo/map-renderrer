@@ -45,6 +45,7 @@ FLAT_NODES_PATH=${FLAT_NODES_PATH:-}
 OSM2PGSQL_EXTRA_ARGS=${OSM2PGSQL_EXTRA_ARGS:-}
 PGDATA_ROOT=${PGDATA_ROOT:-/data/db}
 LAYER_SRS=${MAPNIK_LAYER_SRS:-EPSG:3857}
+RENDER_PROGRESS_INTERVAL=${RENDER_PROGRESS_INTERVAL:-500}
 
 PIPELINE_STAGE="all"
 
@@ -522,7 +523,13 @@ RENDERD_CONF
   fi
 
   log "Rendering tiles from zoom ${MIN_ZOOM} to ${MAX_ZOOM}."
-  runuser -u postgres -- render_list -a -f -s /var/run/renderd/renderd.sock -n "${RENDER_THREADS}" -m default -z "${MIN_ZOOM}" -Z "${MAX_ZOOM}"
+  local progress_interval=${RENDER_PROGRESS_INTERVAL}
+  if [[ "${progress_interval}" =~ ^[0-9]+$ ]] && (( progress_interval > 0 )); then
+    runuser -u postgres -- render_list -a -f -s /var/run/renderd/renderd.sock -n "${RENDER_THREADS}" -m default -z "${MIN_ZOOM}" -Z "${MAX_ZOOM}" \
+      | monitor_render_progress "${progress_interval}"
+  else
+    runuser -u postgres -- render_list -a -f -s /var/run/renderd/renderd.sock -n "${RENDER_THREADS}" -m default -z "${MIN_ZOOM}" -Z "${MAX_ZOOM}"
+  fi
 
   log "Tile rendering complete. Output stored in ${RENDER_OUTPUT_ROOT}."
   if [[ -n "${RENDERD_PID:-}" ]]; then
@@ -533,6 +540,24 @@ RENDERD_CONF
   if [[ -n "${RENDERD_WRAPPER_PID:-}" ]]; then
     wait "${RENDERD_WRAPPER_PID}" 2>/dev/null || true
     unset RENDERD_WRAPPER_PID
+  fi
+}
+
+monitor_render_progress() {
+  local interval=$1
+  local count=0
+  local next_log=${interval}
+
+  while IFS= read -r _; do
+    (( count++ ))
+    if (( count >= next_log )); then
+      log "Rendered ${count} tiles so far."
+      next_log=$((next_log + interval))
+    fi
+  done
+
+  if (( count > 0 )) && (( (count - interval) % interval != 0 )); then
+    log "Rendered ${count} tiles so far."
   fi
 }
 
