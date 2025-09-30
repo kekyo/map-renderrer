@@ -5,6 +5,32 @@ log() {
   echo "[$(date '+%Y-%m-%dT%H:%M:%S%z')] $*"
 }
 
+SCRIPT_NAME=${0##*/}
+
+usage() {
+  cat <<USAGE
+Usage: ${SCRIPT_NAME} [options] [import|render|all]
+
+Options:
+  --pbf PATH              Set the input PBF file path (default: ${PBF_PATH})
+  --render-output DIR     Set the render output directory (default: ${RENDER_OUTPUT_ROOT})
+  --pgdata-root DIR       Set the PostgreSQL data root (default: ${PGDATA_ROOT})
+  --db-name NAME          Override the database name (default: ${POSTGRES_DB})
+  --min-zoom VALUE        Minimum zoom level to render (default: ${MIN_ZOOM})
+  --max-zoom VALUE        Maximum zoom level to render (default: ${MAX_ZOOM})
+  --flat-nodes PATH       Path to osm2pgsql flat nodes file
+  --reset-database        Force database drop before import
+  --no-reset-database     Skip database reset even if RESET_DATABASE=true
+  --stage STAGE           Explicitly choose stage: import|render|all
+  -h, --help              Show this help and exit
+
+Stages (positional argument):
+  import    Import the PBF into PostGIS and refresh indexes/statistics.
+  render    Render tiles from the existing PostGIS database.
+  all       Run both stages sequentially (default).
+USAGE
+}
+
 PBF_PATH=${PBF_PATH:-/data/map.osm.pbf}
 RENDER_OUTPUT_ROOT=${RENDER_OUTPUT_ROOT:-/data/rendered}
 POSTGRES_DB=${POSTGRES_DB:-gis}
@@ -18,54 +44,159 @@ RESET_DATABASE=${RESET_DATABASE:-true}
 FLAT_NODES_PATH=${FLAT_NODES_PATH:-}
 OSM2PGSQL_EXTRA_ARGS=${OSM2PGSQL_EXTRA_ARGS:-}
 PGDATA_ROOT=${PGDATA_ROOT:-/data/db}
-STATE_DIR=${STEP_STATE_DIR:-${PGDATA_ROOT}/state}
-STYLE_VERSION=2
 LAYER_SRS=${MAPNIK_LAYER_SRS:-EPSG:3857}
+
+PIPELINE_STAGE="all"
 
 RENDERD_PID=""
 RENDERD_WRAPPER_PID=""
 
-if command -v readlink >/dev/null 2>&1; then
-  STATE_DIR=$(readlink -f "${STATE_DIR}" 2>/dev/null || printf '%s' "${STATE_DIR}")
+while (( $# )); do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --pbf)
+      if [[ $# -lt 2 ]]; then
+        log "--pbf requires a path argument."
+        usage
+        exit 1
+      fi
+      PBF_PATH=$2
+      shift 2
+      continue
+      ;;
+    --render-output)
+      if [[ $# -lt 2 ]]; then
+        log "--render-output requires a directory argument."
+        usage
+        exit 1
+      fi
+      RENDER_OUTPUT_ROOT=$2
+      shift 2
+      continue
+      ;;
+    --pgdata-root)
+      if [[ $# -lt 2 ]]; then
+        log "--pgdata-root requires a directory argument."
+        usage
+        exit 1
+      fi
+      PGDATA_ROOT=$2
+      shift 2
+      continue
+      ;;
+    --db-name)
+      if [[ $# -lt 2 ]]; then
+        log "--db-name requires a value."
+        usage
+        exit 1
+      fi
+      POSTGRES_DB=$2
+      shift 2
+      continue
+      ;;
+    --min-zoom)
+      if [[ $# -lt 2 ]]; then
+        log "--min-zoom requires a value."
+        usage
+        exit 1
+      fi
+      MIN_ZOOM=$2
+      shift 2
+      continue
+      ;;
+    --max-zoom)
+      if [[ $# -lt 2 ]]; then
+        log "--max-zoom requires a value."
+        usage
+        exit 1
+      fi
+      MAX_ZOOM=$2
+      shift 2
+      continue
+      ;;
+    --flat-nodes)
+      if [[ $# -lt 2 ]]; then
+        log "--flat-nodes requires a path argument."
+        usage
+        exit 1
+      fi
+      FLAT_NODES_PATH=$2
+      shift 2
+      continue
+      ;;
+    --reset-database)
+      RESET_DATABASE=true
+      shift
+      continue
+      ;;
+    --no-reset-database)
+      RESET_DATABASE=false
+      shift
+      continue
+      ;;
+    --stage)
+      if [[ $# -lt 2 ]]; then
+        log "--stage requires a value (import|render|all)."
+        usage
+        exit 1
+      fi
+      case "$2" in
+        import|render|all)
+          PIPELINE_STAGE=$2
+          ;;
+        *)
+          log "Unknown stage '$2'."
+          usage
+          exit 1
+          ;;
+      esac
+      shift 2
+      continue
+      ;;
+    --)
+      shift
+      break
+      ;;
+    import|render|all)
+      PIPELINE_STAGE=$1
+      shift
+      continue
+      ;;
+    -* )
+      log "Unknown option '$1'."
+      usage
+      exit 1
+      ;;
+    *)
+      log "Unexpected argument '$1'."
+      usage
+      exit 1
+      ;;
+  esac
+done
+
+if (( $# )); then
+  if (( $# == 1 )); then
+    case "$1" in
+      import|render|all)
+        PIPELINE_STAGE=$1
+        shift
+        ;;
+      *)
+        log "Unexpected argument '$1'."
+        usage
+        exit 1
+        ;;
+    esac
+  else
+    log "Too many arguments: $*"
+    usage
+    exit 1
+  fi
 fi
-
-mkdir -p "${STATE_DIR}"
-chown -R postgres:postgres "${STATE_DIR}"
-
-state_file() {
-  printf '%s/%s.state' "${STATE_DIR}" "$1"
-}
-
-state_mark() {
-  local step=$1 token=$2
-  printf '%s\n' "${token}" >"$(state_file "${step}")"
-}
-
-state_clear() {
-  rm -f "$(state_file "$1")"
-}
-
-state_matches() {
-  local step=$1 token=$2 file
-  file=$(state_file "${step}")
-  [[ -f "${file}" ]] && [[ "$(<"${file}")" == "${token}" ]]
-}
-
-hash_payload() {
-  printf '%s' "$1" | sha256sum | awk '{print $1}'
-}
-
-clear_processing_state() {
-  local step
-  for step in osm-import vacuum render-tiles; do
-    state_clear "${step}"
-  done
-}
-
-clear_downstream_steps() {
-  state_clear "vacuum"
-  state_clear "render-tiles"
-}
 
 discover_first_existing_dir() {
   local pattern candidate
@@ -89,24 +220,9 @@ discover_first_existing_dir() {
   return 1
 }
 
-if [[ ! -f "${PBF_PATH}" ]]; then
-  log "Missing PBF file at ${PBF_PATH}. Mount the file into the container."
-  exit 1
-fi
-
-PBF_FINGERPRINT=$(stat -c '%s:%Y:%n' "${PBF_PATH}")
-IMPORT_TOKEN=$(hash_payload "import-v1|${PBF_FINGERPRINT}|cache=${OSM2PGSQL_CACHE}|procs=${OSM2PGSQL_NUM_PROCESSES}|flat=${FLAT_NODES_PATH}|extra=${OSM2PGSQL_EXTRA_ARGS}")
-RENDER_TOKEN=$(hash_payload "render-v${STYLE_VERSION}|${IMPORT_TOKEN}|min=${MIN_ZOOM}|max=${MAX_ZOOM}|threads=${RENDER_THREADS}|xml=${MAPNIK_XML}")
-
 mkdir -p "${RENDER_OUTPUT_ROOT}" /var/run/renderd "${PGDATA_ROOT}"
 chown -R postgres:postgres /var/run/renderd
 chmod 775 /var/run/renderd 2>/dev/null || true
-
-if [[ "${RESET_DATABASE}" == "true" ]]; then
-  log "RESET_DATABASE requested; clearing cached step markers."
-  clear_processing_state
-  rm -f "${RENDER_OUTPUT_ROOT}/planet-import-complete"
-fi
 
 cluster_info=$(pg_lsclusters | awk 'NR==2 {print $1" "$2" "$6}')
 if [[ -z "${cluster_info}" ]]; then
@@ -199,8 +315,6 @@ ensure_database() {
   runuser -u postgres -- psql -d "${db_name}" -c "CREATE EXTENSION IF NOT EXISTS hstore"
 }
 
-ensure_database "${POSTGRES_DB}" "${RESET_DATABASE}"
-
 import_data() {
   local db_name=$1
 
@@ -228,6 +342,14 @@ import_data() {
     "${flat_nodes_args[@]}" \
     "${extra_args[@]}" \
     "${PBF_PATH}"
+}
+
+
+refresh_database_statistics() {
+  local db_name=$1
+
+  log "Running VACUUM ANALYZE to refresh planner statistics."
+  runuser -u postgres -- psql -d "${db_name}" -c "VACUUM ANALYZE"
 }
 
 
@@ -371,8 +493,6 @@ TILESIZE=256
 MAXZOOM=${MAX_ZOOM}
 RENDERD_CONF
 
-  touch "${RENDER_OUTPUT_ROOT}/planet-import-complete"
-
   rm -f /var/run/renderd/renderd.sock
 
   log "Starting renderd as postgres user."
@@ -416,39 +536,44 @@ RENDERD_CONF
   fi
 }
 
-if state_matches "osm-import" "${IMPORT_TOKEN}"; then
-  log "Skipping osm2pgsql import; checkpoint detected."
-else
-  state_clear "osm-import"
-  clear_downstream_steps
-  import_data "${POSTGRES_DB}"
-  state_mark "osm-import" "${IMPORT_TOKEN}"
-fi
-
-touch "${RENDER_OUTPUT_ROOT}/planet-import-complete"
-
-if state_matches "vacuum" "${IMPORT_TOKEN}"; then
-  log "Skipping VACUUM ANALYZE; checkpoint detected."
-else
-  log "Running VACUUM ANALYZE to refresh planner statistics."
-  runuser -u postgres -- psql -d "${POSTGRES_DB}" -c "VACUUM ANALYZE"
-  state_mark "vacuum" "${IMPORT_TOKEN}"
-fi
-
-render_required=1
-if state_matches "render-tiles" "${RENDER_TOKEN}"; then
-  if [[ -d "${RENDER_OUTPUT_ROOT}" ]]; then
-    log "Skipping tile rendering; checkpoint detected."
-    render_required=0
-  else
-    log "Render checkpoint present but ${RENDER_OUTPUT_ROOT} missing; rerunning pipeline."
+run_import_stage() {
+  if [[ ! -f "${PBF_PATH}" ]]; then
+    log "Missing PBF file at ${PBF_PATH}. Mount the file into the container."
+    exit 1
   fi
-fi
 
-if (( render_required )); then
-  state_clear "render-tiles"
+  log "Running import stage (osm2pgsql + VACUUM)."
+
+  if [[ "${RESET_DATABASE}" == "true" ]]; then
+    log "RESET_DATABASE requested; dropping and recreating ${POSTGRES_DB}."
+  fi
+
+  ensure_database "${POSTGRES_DB}" "${RESET_DATABASE}"
+  import_data "${POSTGRES_DB}"
+  refresh_database_statistics "${POSTGRES_DB}"
+}
+
+run_render_stage() {
+  log "Running render stage (renderd + render_list)."
+
+  ensure_database "${POSTGRES_DB}" "false"
   render_tiles
-  state_mark "render-tiles" "${RENDER_TOKEN}"
-else
-  log "Tile rendering already up to date; skipping render step."
-fi
+}
+
+case "${PIPELINE_STAGE}" in
+  import)
+    run_import_stage
+    ;;
+  render)
+    run_render_stage
+    ;;
+  all)
+    run_import_stage
+    run_render_stage
+    ;;
+  *)
+    log "Unknown stage '${PIPELINE_STAGE}'. Expected import, render, or all."
+    usage
+    exit 1
+    ;;
+esac
