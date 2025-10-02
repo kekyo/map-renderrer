@@ -49,11 +49,14 @@ PGDATA_ROOT=${PGDATA_ROOT:-/data/db}
 LAYER_SRS=${MAPNIK_LAYER_SRS:-EPSG:3857}
 RENDER_PROGRESS_INTERVAL=${RENDER_PROGRESS_INTERVAL:-500}
 RENDER_PROGRESS_MODE=${RENDER_PROGRESS_MODE:-zoom}
+RENDER_LOG_DIR=${RENDER_LOG_DIR:-/tmp/map-renderer}
+RENDER_LOG_PATH=${RENDER_LOG_PATH:-}
 
 PIPELINE_STAGE="all"
 
 RENDERD_PID=""
 RENDERD_WRAPPER_PID=""
+RENDER_SESSION_LOG=""
 
 while (( $# )); do
   case "$1" in
@@ -253,6 +256,34 @@ discover_first_existing_dir() {
   return 1
 }
 
+prepare_render_log() {
+  if [[ -n "${RENDER_SESSION_LOG:-}" ]]; then
+    return
+  fi
+
+  local ts
+  ts=$(date '+%Y%m%dT%H%M%S')
+  local target_path
+  if [[ -n "${RENDER_LOG_PATH:-}" ]]; then
+    target_path=${RENDER_LOG_PATH}
+  else
+    local dir=${RENDER_LOG_DIR%/}
+    target_path="${dir}/render-list-${ts}.log"
+  fi
+
+  mkdir -p "$(dirname "${target_path}")"
+  : >"${target_path}"
+  RENDER_SESSION_LOG=${target_path}
+  log "Logging render_list output to ${RENDER_SESSION_LOG}."
+}
+
+append_render_log() {
+  if [[ -z "${RENDER_SESSION_LOG:-}" ]]; then
+    return
+  fi
+  printf '[%s] %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*" >>"${RENDER_SESSION_LOG}"
+}
+
 mkdir -p "${RENDER_OUTPUT_ROOT}" /var/run/renderd "${PGDATA_ROOT}"
 chown -R postgres:postgres /var/run/renderd
 chmod 775 /var/run/renderd 2>/dev/null || true
@@ -429,6 +460,9 @@ configure_mapnik_paths() {
 render_tiles() {
   configure_mapnik_paths
 
+  prepare_render_log
+  append_render_log "BEGIN render stage min=${MIN_ZOOM} max=${MAX_ZOOM} mode=${RENDER_PROGRESS_MODE} threads=${RENDER_THREADS}"
+
   log "Generating Mapnik stylesheet at ${MAPNIK_XML}."
   cat >"${MAPNIK_XML}" <<MAPNIK
 <Map background-color="#f2efe9" srs="+proj=merc +a=6378137 +b=6378137 +lat_ts=0.0 +lon_0=0.0 +x_0=0.0 +y_0=0 +units=m +nadgrids=@null +wktext +no_defs">
@@ -555,16 +589,27 @@ RENDERD_CONF
   fi
 
   log "Rendering tiles from zoom ${MIN_ZOOM} to ${MAX_ZOOM} (progress mode: ${RENDER_PROGRESS_MODE})."
+  local render_status=0
   case "${RENDER_PROGRESS_MODE}" in
     interval)
-      render_tiles_with_interval
+      if ! render_tiles_with_interval; then
+        render_status=$?
+      fi
       ;;
     zoom|*)
-      render_tiles_by_zoom
+      if ! render_tiles_by_zoom; then
+        render_status=$?
+      fi
       ;;
   esac
 
-  log "Tile rendering complete. Output stored in ${RENDER_OUTPUT_ROOT}."
+  if (( render_status != 0 )); then
+    append_render_log "Render stage failed exit=${render_status}"
+    log "Tile rendering failed. See ${RENDER_SESSION_LOG} for details."
+  else
+    append_render_log "Render stage completed successfully"
+    log "Tile rendering complete. Output stored in ${RENDER_OUTPUT_ROOT}."
+  fi
   if [[ -n "${RENDERD_PID:-}" ]]; then
     log "Stopping renderd (pid=${RENDERD_PID})."
     kill "${RENDERD_PID}" >/dev/null 2>&1 || true
@@ -574,15 +619,30 @@ RENDERD_CONF
     wait "${RENDERD_WRAPPER_PID}" 2>/dev/null || true
     unset RENDERD_WRAPPER_PID
   fi
+  if (( render_status != 0 )); then
+    return "${render_status}"
+  fi
 }
 
 render_tiles_with_interval() {
   local progress_interval=${RENDER_PROGRESS_INTERVAL}
   if [[ "${progress_interval}" =~ ^[0-9]+$ ]] && (( progress_interval > 0 )); then
-    render_list_exec "${MIN_ZOOM}" "${MAX_ZOOM}" | monitor_render_progress "${progress_interval}"
+    if ! run_render_list_range "${MIN_ZOOM}" "${MAX_ZOOM}" "interval" "${progress_interval}"; then
+      local status=$?
+      append_render_log "render_list failed for range ${MIN_ZOOM}-${MAX_ZOOM} exit=${status}"
+      log "render_list failed while rendering zoom range ${MIN_ZOOM}-${MAX_ZOOM}. See ${RENDER_SESSION_LOG}."
+      return "${status}"
+    fi
   else
-    render_list_exec "${MIN_ZOOM}" "${MAX_ZOOM}"
+    log "Progress interval disabled; streaming render_list output without aggregation."
+    if ! run_render_list_range "${MIN_ZOOM}" "${MAX_ZOOM}" "plain"; then
+      local status=$?
+      append_render_log "render_list failed for range ${MIN_ZOOM}-${MAX_ZOOM} exit=${status}"
+      log "render_list failed while rendering zoom range ${MIN_ZOOM}-${MAX_ZOOM}. See ${RENDER_SESSION_LOG}."
+      return "${status}"
+    fi
   fi
+  return 0
 }
 
 render_tiles_by_zoom() {
@@ -594,15 +654,60 @@ render_tiles_by_zoom() {
     ((completed++))
     local tiles_estimate=$(( (1 << zoom) * (1 << zoom) ))
     log "Rendering zoom ${zoom} (${completed}/${total_levels}); ~${tiles_estimate} tiles (global)."
-    render_list_exec "${zoom}" "${zoom}"
+    append_render_log "BEGIN zoom ${zoom} (${completed}/${total_levels})"
+    if ! run_render_list_range "${zoom}" "${zoom}" "plain"; then
+      local status=$?
+      append_render_log "FAILED zoom ${zoom} exit=${status}"
+      log "render_list failed at zoom ${zoom}; see ${RENDER_SESSION_LOG}."
+      return "${status}"
+    fi
+    append_render_log "COMPLETED zoom ${zoom}"
     log "Completed zoom ${zoom} (${completed}/${total_levels})."
   done
+
+  return 0
 }
 
-render_list_exec() {
+run_render_list_range() {
   local min_zoom=$1
   local max_zoom=$2
-  runuser -u postgres -- render_list -a -f -s /var/run/renderd/renderd.sock -n "${RENDER_THREADS}" -m default -z "${min_zoom}" -Z "${max_zoom}"
+  local mode=${3:-plain}
+  local progress_interval=${4:-0}
+
+  local log_path=${RENDER_SESSION_LOG:-}
+  local cmd_desc="render_list -z ${min_zoom} -Z ${max_zoom}"
+  local cmd=(runuser -u postgres -- render_list -a -f -s /var/run/renderd/renderd.sock -n "${RENDER_THREADS}" -m default -z "${min_zoom}" -Z "${max_zoom}")
+
+  append_render_log "COMMAND ${cmd_desc}"
+
+  local status=0
+  if [[ "${mode}" == "interval" ]]; then
+    if [[ -n "${log_path}" ]]; then
+      "${cmd[@]}" 2> >(tee -a "${log_path}" >&2) | tee -a "${log_path}" | monitor_render_progress "${progress_interval}"
+      local -a pipeline_status=( "${PIPESTATUS[@]}" )
+      status=${pipeline_status[0]}
+      append_render_log "STATUS render_list=${pipeline_status[0]} tee=${pipeline_status[1]:-0} monitor=${pipeline_status[2]:-0}"
+    else
+      "${cmd[@]}" | monitor_render_progress "${progress_interval}"
+      local -a pipeline_status=( "${PIPESTATUS[@]}" )
+      status=${pipeline_status[0]}
+      append_render_log "STATUS render_list=${pipeline_status[0]} monitor=${pipeline_status[1]:-0}"
+    fi
+  else
+    if [[ -n "${log_path}" ]]; then
+      "${cmd[@]}" 2> >(tee -a "${log_path}" >&2) | tee -a "${log_path}"
+      local -a pipeline_status=( "${PIPESTATUS[@]}" )
+      status=${pipeline_status[0]}
+      append_render_log "STATUS render_list=${pipeline_status[0]} tee=${pipeline_status[1]:-0}"
+    else
+      "${cmd[@]}"
+      status=$?
+      append_render_log "STATUS render_list=${status}"
+    fi
+  fi
+
+  append_render_log "END ${cmd_desc} exit=${status}"
+  return "${status}"
 }
 
 monitor_render_progress() {
