@@ -19,6 +19,8 @@ Options:
   --min-zoom VALUE        Minimum zoom level to render (default: ${MIN_ZOOM})
   --max-zoom VALUE        Maximum zoom level to render (default: ${MAX_ZOOM})
   --flat-nodes PATH       Path to osm2pgsql flat nodes file
+  --progress-mode MODE    Progress reporting mode: interval|zoom (default: ${RENDER_PROGRESS_MODE})
+  --render-progress VALUE Report progress every N tiles when using interval mode (default: ${RENDER_PROGRESS_INTERVAL})
   --reset-database        Force database drop before import
   --no-reset-database     Skip database reset even if RESET_DATABASE=true
   --stage STAGE           Explicitly choose stage: import|render|all
@@ -46,6 +48,7 @@ OSM2PGSQL_EXTRA_ARGS=${OSM2PGSQL_EXTRA_ARGS:-}
 PGDATA_ROOT=${PGDATA_ROOT:-/data/db}
 LAYER_SRS=${MAPNIK_LAYER_SRS:-EPSG:3857}
 RENDER_PROGRESS_INTERVAL=${RENDER_PROGRESS_INTERVAL:-500}
+RENDER_PROGRESS_MODE=${RENDER_PROGRESS_MODE:-interval}
 
 PIPELINE_STAGE="all"
 
@@ -125,6 +128,35 @@ while (( $# )); do
         exit 1
       fi
       FLAT_NODES_PATH=$2
+      shift 2
+      continue
+      ;;
+    --progress-mode)
+      if [[ $# -lt 2 ]]; then
+        log "--progress-mode requires a value (interval|zoom)."
+        usage
+        exit 1
+      fi
+      case "$2" in
+        interval|zoom)
+          RENDER_PROGRESS_MODE=$2
+          ;;
+        *)
+          log "Unknown progress mode '$2'."
+          usage
+          exit 1
+          ;;
+      esac
+      shift 2
+      continue
+      ;;
+    --render-progress)
+      if [[ $# -lt 2 ]]; then
+        log "--render-progress requires a numeric value."
+        usage
+        exit 1
+      fi
+      RENDER_PROGRESS_INTERVAL=$2
       shift 2
       continue
       ;;
@@ -522,14 +554,15 @@ RENDERD_CONF
     RENDERD_PID=${RENDERD_WRAPPER_PID}
   fi
 
-  log "Rendering tiles from zoom ${MIN_ZOOM} to ${MAX_ZOOM}."
-  local progress_interval=${RENDER_PROGRESS_INTERVAL}
-  if [[ "${progress_interval}" =~ ^[0-9]+$ ]] && (( progress_interval > 0 )); then
-    runuser -u postgres -- render_list -a -f -s /var/run/renderd/renderd.sock -n "${RENDER_THREADS}" -m default -z "${MIN_ZOOM}" -Z "${MAX_ZOOM}" \
-      | monitor_render_progress "${progress_interval}"
-  else
-    runuser -u postgres -- render_list -a -f -s /var/run/renderd/renderd.sock -n "${RENDER_THREADS}" -m default -z "${MIN_ZOOM}" -Z "${MAX_ZOOM}"
-  fi
+  log "Rendering tiles from zoom ${MIN_ZOOM} to ${MAX_ZOOM} (progress mode: ${RENDER_PROGRESS_MODE})."
+  case "${RENDER_PROGRESS_MODE}" in
+    interval)
+      render_tiles_with_interval
+      ;;
+    zoom|*)
+      render_tiles_by_zoom
+      ;;
+  esac
 
   log "Tile rendering complete. Output stored in ${RENDER_OUTPUT_ROOT}."
   if [[ -n "${RENDERD_PID:-}" ]]; then
@@ -541,6 +574,35 @@ RENDERD_CONF
     wait "${RENDERD_WRAPPER_PID}" 2>/dev/null || true
     unset RENDERD_WRAPPER_PID
   fi
+}
+
+render_tiles_with_interval() {
+  local progress_interval=${RENDER_PROGRESS_INTERVAL}
+  if [[ "${progress_interval}" =~ ^[0-9]+$ ]] && (( progress_interval > 0 )); then
+    render_list_exec "${MIN_ZOOM}" "${MAX_ZOOM}" | monitor_render_progress "${progress_interval}"
+  else
+    render_list_exec "${MIN_ZOOM}" "${MAX_ZOOM}"
+  fi
+}
+
+render_tiles_by_zoom() {
+  local total_levels=$(( MAX_ZOOM - MIN_ZOOM + 1 ))
+  local completed=0
+  local zoom
+
+  for (( zoom=MIN_ZOOM; zoom<=MAX_ZOOM; zoom++ )); do
+    ((completed++))
+    local tiles_estimate=$(( (1 << zoom) * (1 << zoom) ))
+    log "Rendering zoom ${zoom} (${completed}/${total_levels}); ~${tiles_estimate} tiles (global)."
+    render_list_exec "${zoom}" "${zoom}"
+    log "Completed zoom ${zoom} (${completed}/${total_levels})."
+  done
+}
+
+render_list_exec() {
+  local min_zoom=$1
+  local max_zoom=$2
+  runuser -u postgres -- render_list -a -f -s /var/run/renderd/renderd.sock -n "${RENDER_THREADS}" -m default -z "${min_zoom}" -Z "${max_zoom}"
 }
 
 monitor_render_progress() {
@@ -556,7 +618,7 @@ monitor_render_progress() {
     fi
   done
 
-  if (( count > 0 )) && (( (count - interval) % interval != 0 )); then
+  if (( count > 0 )) && (( interval > 0 )) && (( count % interval != 0 )); then
     log "Rendered ${count} tiles so far."
   fi
 }

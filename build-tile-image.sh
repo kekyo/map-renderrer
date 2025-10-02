@@ -12,6 +12,7 @@ Options:
   --render-threads VALUE   Override RENDER_THREADS used by renderd
   --osm-cache VALUE        Override OSM2PGSQL_CACHE (in MiB)
   --osm-procs VALUE        Override OSM2PGSQL_NUM_PROCESSES
+  --progress-mode MODE     Progress reporting mode (interval|zoom)
   --render-progress VALUE  Report progress every N tiles (0 disables progress logs)
   --reset-database         Force database reset before import
   --no-reset-database      Skip resetting the database before import
@@ -31,6 +32,7 @@ MAX_ZOOM_OVERRIDE=""
 RENDER_THREADS_OVERRIDE=""
 OSM_CACHE_OVERRIDE=""
 OSM_PROCS_OVERRIDE=""
+RENDER_PROGRESS_MODE_OVERRIDE=""
 RENDER_PROGRESS_OVERRIDE=""
 RESET_DATABASE_OVERRIDE=""
 IMAGE_TAG_OVERRIDE=""
@@ -89,6 +91,25 @@ while [[ $# -gt 0 ]]; do
         exit 1
       fi
       OSM_PROCS_OVERRIDE=$2
+      shift 2
+      continue
+      ;;
+    --progress-mode)
+      if [[ $# -lt 2 ]]; then
+        echo '--progress-mode requires a value (interval|zoom).' >&2
+        usage >&2
+        exit 1
+      fi
+      case "$2" in
+        interval|zoom)
+          RENDER_PROGRESS_MODE_OVERRIDE=$2
+          ;;
+        *)
+          echo "Invalid progress mode '$2'. Expected interval or zoom." >&2
+          usage >&2
+          exit 1
+          ;;
+      esac
       shift 2
       continue
       ;;
@@ -263,6 +284,9 @@ if [[ -n "${OSM_CACHE_OVERRIDE}" ]]; then
 fi
 if [[ -n "${OSM_PROCS_OVERRIDE}" ]]; then
   ENV_ARGS+=(-e OSM2PGSQL_NUM_PROCESSES="${OSM_PROCS_OVERRIDE}")
+fi
+if [[ -n "${RENDER_PROGRESS_MODE_OVERRIDE}" ]]; then
+  ENV_ARGS+=(-e RENDER_PROGRESS_MODE="${RENDER_PROGRESS_MODE_OVERRIDE}")
 fi
 if [[ -n "${RENDER_PROGRESS_OVERRIDE}" ]]; then
   ENV_ARGS+=(-e RENDER_PROGRESS_INTERVAL="${RENDER_PROGRESS_OVERRIDE}")
